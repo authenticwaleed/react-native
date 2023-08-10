@@ -314,8 +314,8 @@ jobs:
   # -------------------------
   test_e2e_android:
     executor:
-        name: android/android-machine
-        tag: 2023.07.1
+      name: android/android-machine
+      tag: 2023.07.1
     steps:
       - checkout_code_with_cache
       - run_yarn
@@ -348,10 +348,12 @@ jobs:
           background: true
       - attach_workspace:
           at: .
-      - run:
-          name: Build app
-          command: |
-            ./gradlew :packages:rn-tester:android:app:assembleHermesDebug -PreactNativeArchitectures=x86_64
+      - with_gradle_cache:
+          steps:
+            - run:
+                name: Build app
+                command: |
+                  ./gradlew :packages:rn-tester:android:app:assembleHermesDebug -PreactNativeArchitectures=x86_64
       - run:
           name: Move app to correct directory
           command: mv packages/rn-tester/android/app/build/outputs/apk/hermes/debug/app-hermes-x86_64-debug.apk packages/rn-tester-e2e/apps/rn-tester.apk
@@ -367,6 +369,57 @@ jobs:
           command: |
             cd packages/rn-tester-e2e
             yarn test-e2e android
+
+  # -------------------------
+  #    JOBS: Build Android
+  # -------------------------
+  build_android:
+    executor: reactnativeandroid-xlarge
+    parameters:
+      release_type:
+        description: The type of release to build. Must be one of "nightly", "release", "dry-run".
+        type: enum
+        enum: ["nightly", "release", "dry-run"]
+        default: "dry-run"
+    steps:
+      - checkout
+      - setup_artifacts
+      - run_yarn
+      - run:
+          name: Set React Native Version
+          command: node ./scripts/set-rn-version.js --build-type << parameters.release_type >>
+
+      - with_gradle_cache:
+          steps:
+            - run:
+                name: Build and publish all the Android Artifacts to /tmp/maven-local
+                command: |
+                  if [[ << parameters.release_type >> == "dry-run" ]]; then
+                    export ORG_GRADLE_PROJECT_reactNativeArchitectures="arm64-v8a"
+                  else
+                    export ORG_GRADLE_PROJECT_reactNativeArchitectures="armeabi-v7a,arm64-v8a,x86,x86_64"
+                  fi
+                  ./gradlew publishAllToMavenTempLocal
+
+      - persist_to_workspace:
+          root: /root/react-native/
+          paths:
+            - build/
+            - .gradle/
+            - packages/rn-tester/android/app/.cxx/
+            - packages/rn-tester/android/app/build/
+            - packages/react-native/sdks/download/
+            - packages/react-native/sdks/hermes/
+            - packages/react-native/ReactAndroid/.cxx/
+            - packages/react-native/ReactAndroid/build/
+            - packages/react-native/ReactAndroid/hermes-engine/.cxx/
+            - packages/react-native/ReactAndroid/hermes-engine/build/
+            - packages/react-native/ReactAndroid/flipper-integration/build/
+            - packages/react-native/ReactAndroid/src/main/jni/prebuilt/
+            - packages/react-native-gradle-plugin/.gradle/
+            - packages/react-native-gradle-plugin/build/
+            - packages/react-native-codegen/lib/
+
   # -------------------------
   #    JOBS: Test Android
   # -------------------------
@@ -376,11 +429,19 @@ jobs:
       - checkout
       - setup_artifacts
       - run_yarn
-      - download_gradle_dependencies
-
       - run:
-          name: Build & Test React Native using Gradle
-          command: ./gradlew build
+          name: Set React Native Version to "dry-run"
+          # test_android executes only for dry-run builds. We need to bump the version for caching
+          # reasons otherwise we won't reuse the artifacts from the build_android job.
+          command: node ./scripts/set-rn-version.js --build-type "dry-run"
+      - attach_workspace:
+          at: .
+
+      - with_gradle_cache:
+          steps:
+            - run:
+                name: Build & Test React Native using Gradle
+                command: ./gradlew build
 
       - report_bundle_size:
           platform: android
@@ -429,21 +490,23 @@ jobs:
             REPO_ROOT=$(pwd)
             node ./scripts/update-template-package.js "{\"react-native\":\"file:$REPO_ROOT/build/$(cat build/react-native-package-version)\"}"
             node ./scripts/template/initialize.js --reactNativeRootPath $REPO_ROOT --templateName $PROJECT_NAME --templateConfigPath "$REPO_ROOT/packages/react-native" --directory "/tmp/$PROJECT_NAME"
-      - run:
-          name: Build the template application for << parameters.flavor >> with Architecture set to << parameters.architecture >>, and using the << parameters.jsengine>> JS engine.
-          command: |
-            cd /tmp/$PROJECT_NAME/android/
-            if [[ << parameters.architecture >> == "NewArch" ]]; then
-              export ORG_GRADLE_PROJECT_newArchEnabled=true
-            else
-              export ORG_GRADLE_PROJECT_newArchEnabled=false
-            fi
-            if [[ << parameters.jsengine >> == "Hermes" ]]; then
-              export ORG_GRADLE_PROJECT_hermesEnabled=true
-            else
-              export ORG_GRADLE_PROJECT_hermesEnabled=false
-            fi
-            ./gradlew assemble<< parameters.flavor >> -PREACT_NATIVE_MAVEN_LOCAL_REPO=/root/react-native/maven-local
+      - with_gradle_cache:
+          steps:
+            - run:
+                name: Build the template application for << parameters.flavor >> with Architecture set to << parameters.architecture >>, and using the << parameters.jsengine>> JS engine.
+                command: |
+                  cd /tmp/$PROJECT_NAME/android/
+                  if [[ << parameters.architecture >> == "NewArch" ]]; then
+                    export ORG_GRADLE_PROJECT_newArchEnabled=true
+                  else
+                    export ORG_GRADLE_PROJECT_newArchEnabled=false
+                  fi
+                  if [[ << parameters.jsengine >> == "Hermes" ]]; then
+                    export ORG_GRADLE_PROJECT_hermesEnabled=true
+                  else
+                    export ORG_GRADLE_PROJECT_hermesEnabled=false
+                  fi
+                  ./gradlew assemble<< parameters.flavor >> -PREACT_NATIVE_MAVEN_LOCAL_REPO=/root/react-native/maven-local
 
       - store_artifacts:
           path: /tmp/AndroidTemplateProject/android/app/build/outputs/apk/
@@ -484,6 +547,18 @@ jobs:
         default: "2.6.10"
         description: The version of ruby that must be used
         type: string
+      podfile_lock_path:
+        type: string
+        default: "/tmp/iOSTemplateProject/ios/Podfile.lock"
+      pods_build_folder:
+        type: string
+        default: "/tmp/iOSTemplateProject/ios/Pods"
+      podfile_lock_cache_key:
+        type: string
+        default: *template_podfile_lock_cache_key
+      cocoapods_cache_key:
+        type: string
+        default: *template_cocoapods_cache_key
     environment:
       - PROJECT_NAME: "iOSTemplateProject"
       - HERMES_WS_DIR: *hermes_workspace_root
@@ -513,38 +588,44 @@ jobs:
             PATH_TO_PACKAGE="$REPO_ROOT/build/$PACKAGE"
             node ./scripts/update-template-package.js "{\"react-native\":\"file:$PATH_TO_PACKAGE\"}"
             node ./scripts/template/initialize.js --reactNativeRootPath $REPO_ROOT --templateName $PROJECT_NAME --templateConfigPath "$REPO_ROOT/packages/react-native" --directory "/tmp/$PROJECT_NAME"
-      - run:
-          name: Install iOS dependencies - Configuration << parameters.flavor >>; New Architecture << parameters.architecture >>; JS Engine << parameters.jsengine>>; Flipper << parameters.flipper >>
-          command: |
-            cd /tmp/$PROJECT_NAME/ios
+      - with_xcodebuild_cache:
+          podfile_lock_path: << parameters.podfile_lock_path >>
+          pods_build_folder: << parameters.pods_build_folder >>
+          cocoapods_cache_key: << parameters.cocoapods_cache_key >>
+          podfile_lock_cache_key: << parameters.podfile_lock_cache_key >>
+          steps:
+            - run:
+                name: Install iOS dependencies - Configuration << parameters.flavor >>; New Architecture << parameters.architecture >>; JS Engine << parameters.jsengine>>; Flipper << parameters.flipper >>
+                command: |
+                  cd /tmp/$PROJECT_NAME/ios
 
-            if [[ << parameters.architecture >> == "NewArch" ]]; then
-              export RCT_NEW_ARCH_ENABLED=1
-            fi
+                  if [[ << parameters.architecture >> == "NewArch" ]]; then
+                    export RCT_NEW_ARCH_ENABLED=1
+                  fi
 
-            if [[ << parameters.jsengine >> == "JSC" ]]; then
-              export USE_HERMES=0
-            fi
+                  if [[ << parameters.jsengine >> == "JSC" ]]; then
+                    export USE_HERMES=0
+                  fi
 
-            if [[ << parameters.flipper >> == "WithoutFlipper" ]]; then
-              export NO_FLIPPER=1
-            fi
+                  if [[ << parameters.flipper >> == "WithoutFlipper" ]]; then
+                    export NO_FLIPPER=1
+                  fi
 
-            if [[ << parameters.use_frameworks >> == "DynamicFrameworks" ]]; then
-              export USE_FRAMEWORKS=dynamic
-            fi
+                  if [[ << parameters.use_frameworks >> == "DynamicFrameworks" ]]; then
+                    export USE_FRAMEWORKS=dynamic
+                  fi
 
-            cd ..
-            bundle install
-            bundle exec pod install --project-directory=ios
-      - run:
-          name: Build template project
-          command: |
-            xcodebuild build \
-              -configuration << parameters.flavor >> \
-              -workspace /tmp/$PROJECT_NAME/ios/$PROJECT_NAME.xcworkspace \
-              -scheme $PROJECT_NAME \
-              -sdk iphonesimulator
+                  cd ..
+                  bundle install
+                  bundle exec pod install --project-directory=ios
+            - run:
+                name: Build template project
+                command: |
+                  xcodebuild build \
+                    -configuration << parameters.flavor >> \
+                    -workspace /tmp/$PROJECT_NAME/ios/$PROJECT_NAME.xcworkspace \
+                    -scheme $PROJECT_NAME \
+                    -sdk iphonesimulator
 
   # -------------------------
   #    JOBS: Test iOS RNTester
@@ -554,26 +635,27 @@ jobs:
   # build toolchain. The `test_ios_rntester` job, instead, takes the
   # same prebuilt for Hermes that we are going to use in the Release.
   test_ios_rntester_hermes_xcode_integration:
-     executor: reactnativeios
-     steps:
+    executor: reactnativeios
+    steps:
       - checkout_code_with_cache
       - run_yarn
       - brew_install:
           package: cmake
-      - run:
-          name: Pod install
-          command: |
-            cd packages/rn-tester
-            rm -rf Pods Podfile.lock
-            bundle install
-            RCT_NEW_ARCH_ENABLED=1 bundle exec pod install
-      - run:
-          name: Build RNTester
-          command: |
-            xcodebuild build \
-              -workspace packages/rn-tester/RNTesterPods.xcworkspace \
-              -scheme RNTester \
-              -sdk iphonesimulator
+      - with_xcodebuild_cache:
+          steps:
+            - run:
+                name: Pod install
+                command: |
+                  cd packages/rn-tester
+                  bundle install
+                  RCT_NEW_ARCH_ENABLED=1 bundle exec pod install
+            - run:
+                name: Build RNTester
+                command: |
+                  xcodebuild build \
+                    -workspace packages/rn-tester/RNTesterPods.xcworkspace \
+                    -scheme RNTester \
+                    -sdk iphonesimulator
 
   test_ios_rntester:
     executor: reactnativeios
@@ -614,36 +696,35 @@ jobs:
       - with_hermes_tarball_cache_span:
           set_tarball_path: True
           steps:
-            - run:
-                name: Install CocoaPods dependencies - Architecture << parameters.architecture >>
-                command: |
-                  rm -rf packages/rn-tester/Pods
+            - with_xcodebuild_cache:
+                steps:
+                  - run:
+                      name: Install CocoaPods dependencies - Architecture << parameters.architecture >>
+                      command: |
+                        if [[ << parameters.architecture >> == "NewArch" ]]; then
+                          export RCT_NEW_ARCH_ENABLED=1
+                        fi
 
-                  if [[ << parameters.architecture >> == "NewArch" ]]; then
-                    export RCT_NEW_ARCH_ENABLED=1
-                  fi
+                        if [[ << parameters.jsengine >> == "JSC" ]]; then
+                          export USE_HERMES=0
+                        fi
 
-                  if [[ << parameters.jsengine >> == "JSC" ]]; then
-                    export USE_HERMES=0
-                  fi
+                        if [[ << parameters.use_frameworks >> == "DynamicFrameworks" ]]; then
+                          export NO_FLIPPER=1
+                          export USE_FRAMEWORKS=dynamic
+                        fi
 
-                  if [[ << parameters.use_frameworks >> == "DynamicFrameworks" ]]; then
-                    export NO_FLIPPER=1
-                    export USE_FRAMEWORKS=dynamic
-                  fi
+                        cd packages/rn-tester
 
-                  cd packages/rn-tester
-
-                  bundle install
-                  bundle exec pod install
-
-      - run:
-          name: Build RNTester
-          command: |
-            xcodebuild build \
-              -workspace packages/rn-tester/RNTesterPods.xcworkspace \
-              -scheme RNTester \
-              -sdk iphonesimulator
+                        bundle install
+                        bundle exec pod install
+                  - run:
+                      name: Build RNTester
+                      command: |
+                        xcodebuild build \
+                          -workspace packages/rn-tester/RNTesterPods.xcworkspace \
+                          -scheme RNTester \
+                          -sdk iphonesimulator
 
   # -------------------------
   #    JOBS: Windows
@@ -897,30 +978,30 @@ jobs:
       - HERMES_WS_DIR: *hermes_workspace_root
       - HERMES_TARBALL_ARTIFACTS_DIR: *hermes_tarball_artifacts_dir
     steps:
-        - *attach_hermes_workspace
-        - stop_job_if_apple_artifacts_are_there:
-            flavor: "All"
-        - checkout_code_with_cache
-        - get_react_native_version
-        - setup_hermes_workspace
-        - restore_cache:
-            key: *hermesc_apple_cache_key
-        - brew_install:
-            package: cmake
-        - run:
-            name: "Build HermesC Apple"
-            command: |
-              cd ./packages/react-native/sdks/hermes || exit 1
-              . ./utils/build-apple-framework.sh
-              build_host_hermesc_if_needed
-        - save_cache:
-            key: *hermesc_apple_cache_key
-            paths:
-              - ./packages/react-native/sdks/hermes/build_host_hermesc
-        - persist_to_workspace:
-            root: ./packages/react-native/sdks/hermes/
-            paths:
-              - build_host_hermesc
+      - *attach_hermes_workspace
+      - stop_job_if_apple_artifacts_are_there:
+          flavor: "All"
+      - checkout_code_with_cache
+      - get_react_native_version
+      - setup_hermes_workspace
+      - restore_cache:
+          key: *hermesc_apple_cache_key
+      - brew_install:
+          package: cmake
+      - run:
+          name: "Build HermesC Apple"
+          command: |
+            cd ./packages/react-native/sdks/hermes || exit 1
+            . ./utils/build-apple-framework.sh
+            build_host_hermesc_if_needed
+      - save_cache:
+          key: *hermesc_apple_cache_key
+          paths:
+            - ./packages/react-native/sdks/hermes/build_host_hermesc
+      - persist_to_workspace:
+          root: ./packages/react-native/sdks/hermes/
+          paths:
+            - build_host_hermesc
 
   build_apple_slices_hermes:
     parameters:
@@ -943,46 +1024,46 @@ jobs:
       - HERMES_TARBALL_ARTIFACTS_DIR: *hermes_tarball_artifacts_dir
       - HERMES_OSXBIN_ARTIFACTS_DIR: *hermes_osxbin_artifacts_dir
     steps:
-        - *attach_hermes_workspace
-        - stop_job_if_apple_artifacts_are_there:
-            flavor: << parameters.flavor >>
-        - checkout_code_with_cache
-        - get_react_native_version
-        - setup_hermes_workspace
-        - restore_cache:
-            key: *hermesc_apple_cache_key
-        - brew_install:
-            package: cmake
-        - restore_cache:
-            key: << parameters.slice_base_cache_key >>-<< parameters.slice >>-<< parameters.flavor >>
-        - run:
-            name: Build the Hermes << parameters.slice >> frameworks
-            command: |
-              cd ./packages/react-native/sdks/hermes || exit 1
-              SLICE=<< parameters.slice >>
-              FLAVOR=<< parameters.flavor >>
-              FINAL_PATH=build_"$SLICE"_"$FLAVOR"
-              echo "Final path for this slice is: $FINAL_PATH"
+      - *attach_hermes_workspace
+      - stop_job_if_apple_artifacts_are_there:
+          flavor: << parameters.flavor >>
+      - checkout_code_with_cache
+      - get_react_native_version
+      - setup_hermes_workspace
+      - restore_cache:
+          key: *hermesc_apple_cache_key
+      - brew_install:
+          package: cmake
+      - restore_cache:
+          key: << parameters.slice_base_cache_key >>-<< parameters.slice >>-<< parameters.flavor >>
+      - run:
+          name: Build the Hermes << parameters.slice >> frameworks
+          command: |
+            cd ./packages/react-native/sdks/hermes || exit 1
+            SLICE=<< parameters.slice >>
+            FLAVOR=<< parameters.flavor >>
+            FINAL_PATH=build_"$SLICE"_"$FLAVOR"
+            echo "Final path for this slice is: $FINAL_PATH"
 
-              if [[ -d "$FINAL_PATH" ]]; then
-                echo "[HERMES] Skipping! Found the requested slice at $FINAL_PATH".
-                exit 0
-              fi
+            if [[ -d "$FINAL_PATH" ]]; then
+              echo "[HERMES] Skipping! Found the requested slice at $FINAL_PATH".
+              exit 0
+            fi
 
-              if [[ "$SLICE" == "macosx" ]]; then
-                echo "[HERMES] Building Hermes for MacOS"
-                BUILD_TYPE="<< parameters.flavor >>" ./utils/build-mac-framework.sh
-              else
-                echo "[HERMES] Building Hermes for iOS: $SLICE"
-                BUILD_TYPE="<< parameters.flavor >>" ./utils/build-ios-framework.sh "$SLICE"
-              fi
+            if [[ "$SLICE" == "macosx" ]]; then
+              echo "[HERMES] Building Hermes for MacOS"
+              BUILD_TYPE="<< parameters.flavor >>" ./utils/build-mac-framework.sh
+            else
+              echo "[HERMES] Building Hermes for iOS: $SLICE"
+              BUILD_TYPE="<< parameters.flavor >>" ./utils/build-ios-framework.sh "$SLICE"
+            fi
 
-              echo "Moving from build_$SLICE to $FINAL_PATH"
-              mv build_"$SLICE" "$FINAL_PATH"
-        - save_cache:
-            key: << parameters.slice_base_cache_key >>-<< parameters.slice >>-<< parameters.flavor >>
-            paths:
-              - ./packages/react-native/sdks/hermes/build_<< parameters.slice >>_<< parameters.flavor >>
+            echo "Moving from build_$SLICE to $FINAL_PATH"
+            mv build_"$SLICE" "$FINAL_PATH"
+      - save_cache:
+          key: << parameters.slice_base_cache_key >>-<< parameters.slice >>-<< parameters.flavor >>
+          paths:
+            - ./packages/react-native/sdks/hermes/build_<< parameters.slice >>_<< parameters.flavor >>
 
   build_hermes_macos:
     parameters:
@@ -1241,7 +1322,8 @@ jobs:
 
       - run_yarn
       - build_packages
-      - download_gradle_dependencies
+      - attach_workspace:
+          at: .
 
       # START: Stables and nightlies
       # This conditional step sets up the necessary credentials for publishing react-native to npm.
@@ -1254,17 +1336,20 @@ jobs:
             - run: echo "//registry.npmjs.org/:_authToken=${CIRCLE_NPM_TOKEN}" > ~/.npmrc
       # END: Stables and nightlies
 
-      - run:
-          name: Publish NPM
-          command: |
-              # We can't have a separate step because each command is executed in a separate shell
-              # so variables exported in a command are not visible in another.
-              if [[ << parameters.release_type >> == "dry-run" ]]; then
-                export ORG_GRADLE_PROJECT_reactNativeArchitectures="arm64-v8a"
-              else
-                export ORG_GRADLE_PROJECT_reactNativeArchitectures="armeabi-v7a,arm64-v8a,x86,x86_64"
-              fi
-              node ./scripts/publish-npm.js --<< parameters.release_type >>
+      - with_gradle_cache:
+          steps:
+            - run:
+                name: Publish NPM
+                command: |
+                  # We can't have a separate step because each command is executed in a separate shell
+                  # so variables exported in a command are not visible in another.
+                  if [[ << parameters.release_type >> == "dry-run" ]]; then
+                    export ORG_GRADLE_PROJECT_reactNativeArchitectures="arm64-v8a"
+                  else
+                    export ORG_GRADLE_PROJECT_reactNativeArchitectures="armeabi-v7a,arm64-v8a,x86,x86_64"
+                  fi
+                  node ./scripts/publish-npm.js --<< parameters.release_type >>
+
       - run:
           name: Zip Maven Artifacts from /tmp/maven-local
           command: zip -r /tmp/maven-local.zip /tmp/maven-local

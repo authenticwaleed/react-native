@@ -10,6 +10,8 @@
           latest : false
           dryrun: true
       - prepare_hermes_workspace
+      - build_android:
+          release_type: "dry-run"
       - test_ios_rntester_hermes_xcode_integration
       - build_hermesc_linux:
           requires:
@@ -37,10 +39,13 @@
           # Build a release package on every untagged commit, but do not publish to npm.
           release_type: "dry-run"
           requires:
+            - build_android
             - build_hermesc_linux
             - build_hermes_macos
             - build_hermesc_windows
-      - test_android
+      - test_android:
+          requires:
+            - build_android
       - test_android_template:
           requires:
             - build_npm_package

@@ -27,6 +27,10 @@ workflows:
     jobs:
       - prepare_hermes_workspace:
           filters: *only_release_tags
+      - build_android:
+          filters: *only_release_tags
+          name: build_android_for_release
+          release_type: "release"
       - build_hermesc_linux:
           filters: *only_release_tags
           requires:
@@ -55,6 +59,7 @@ workflows:
           release_type: "release"
           filters: *only_release_tags
           requires:
+            - build_android_for_release
             - build_hermesc_linux
             - build_hermes_macos
             - build_hermesc_windows
@@ -76,6 +81,8 @@ workflows:
     jobs:
       - nightly_job
       - prepare_hermes_workspace
+      - build_android:
+          release_type: "nightly"
       - build_hermesc_linux:
           requires:
             - prepare_hermes_workspace
@@ -98,6 +105,7 @@ workflows:
       - build_npm_package:
           release_type: "nightly"
           requires:
+            - build_android
             - build_hermesc_linux
             - build_hermes_macos
             - build_hermesc_windows
